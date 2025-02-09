@@ -1,139 +1,149 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.IO.Ports;
 using System.Timers;
 
-namespace jeeDTray
-{
-    internal class COMAudioReader
-    {
-        private SerialPort port;
-        private Timer timer;
-        private bool debug;
+namespace jeeDTray {
+    internal class COMAudioReader : IDisposable {
+        private readonly SerialPort _port;
+        private readonly Timer _timer;
+        private readonly bool _debug;
+        private readonly ConcurrentQueue<string> _messageQueue;
+        private readonly int _bufferSize = 4096;
+        private volatile bool _isRunning;
 
-        /*
-        private string oldHeadset = "";
-        private string oldVolumes = "";
-        */
+        private string _lastHeadsetValue = string.Empty;
+        private string _lastVolumesValue = string.Empty;
 
+        public COMAudioReader(SerialPort port, int readInterval, bool debug = false) {
+            _port = port ?? throw new ArgumentNullException(nameof(port));
+            _debug = debug;
+            _messageQueue = new ConcurrentQueue<string>();
 
-        public COMAudioReader(SerialPort port, int readInterval, bool debug = false)
-        {
-            this.port = port;
-            this.debug = debug;
+            _port.ReadBufferSize = _bufferSize;
+            _port.ReceivedBytesThreshold = 1;
 
-            timer = new Timer();
-            timer.Elapsed += Reading;
-            timer.Interval = readInterval;
+            _timer = new Timer(readInterval) {
+                AutoReset = true
+            };
+            _timer.Elapsed += ProcessQueue;
 
-            Logger.Info("COM Audio Reader initialized to \"" + port.PortName + "\" at \"" + port.BaudRate + "\" (baud rate).");
+            Logger.Info($"COM Audio Reader initialized to \"{port.PortName}\" at \"{port.BaudRate}\" (baud rate).");
         }
 
         public event EventHandler<PortEventArgs> PortCloseEventHandler;
         public event EventHandler<AudioEventArgs> DevicesEventHandler;
         public event EventHandler<AudioEventArgs> VolumesEventHandler;
 
+        private void DataReceivedHandler(object sender, SerialDataReceivedEventArgs e) {
+            if(!_isRunning) return;
 
-        private void Reading(object sender, ElapsedEventArgs e)
-        {
-            try
-            {
-                if(!port.IsOpen)
-                {
-                    this.Stop();
-                    PortCloseEventHandler?.Invoke(e, new PortEventArgs());
-                    return;
+            try {
+                while(_port.BytesToRead > 0) {
+                    string input = _port.ReadLine();
+                    _messageQueue.Enqueue(input);
                 }
-
-                if(port.BytesToRead <= 0) return;
-
-                string input = port.ReadLine();
-
-                if(this.debug)
-                {
-                    Logger.Info(input);
-                }
-
-                if(input.StartsWith("hds="))
-                {
-                    /*if(oldHeadset == input) return;
-                    oldHeadset = input;*/
-
-                    DevicesEventHandler?.Invoke(e, new AudioEventArgs(splitting(input.Substring(4))));
-                } else if(input.StartsWith("sliders="))
-                {
-                    /*if(oldVolumes == input) return;
-                    oldVolumes = input;*/
-
-                    VolumesEventHandler?.Invoke(e, new AudioEventArgs(splitting(input.Substring(8))));
-                }
-
-            } catch(Exception ex)
-            {
-                if(debug)
-                {
-                    Logger.Error(ex.Message + "\n" + ex.StackTrace);
-                } else
-                {
-                    Logger.Error(ex.Message);
-                }
+            } catch(Exception ex) {
+                HandleException(ex);
             }
-
         }
 
-        public void Start()
-        {
-            if(!port.IsOpen)
-            {
-                port.Open();
-            }
+        private void ProcessQueue(object sender, ElapsedEventArgs e) {
+            if(!_isRunning) return;
 
-            timer.Start();
+            while(_messageQueue.TryDequeue(out string input)) {
+                try {
+                    ProcessMessage(input);
+                } catch(Exception ex) {
+                    HandleException(ex);
+                }
+            }
         }
 
-        public void Stop()
-        {
-            if(port.IsOpen)
-            {
-                port.Close();
+        private void ProcessMessage(string input) {
+            if(_debug) {
+                Logger.Info(input);
             }
 
-            timer.Stop();
+            if(input.StartsWith("hds=", StringComparison.Ordinal)) {
+                string newValue = input.Substring(4);
+                if(newValue != _lastHeadsetValue) {
+                    _lastHeadsetValue = newValue;
+                    DevicesEventHandler?.Invoke(this, new AudioEventArgs(SplitMessage(newValue)));
+                }
+            } else if(input.StartsWith("sliders=", StringComparison.Ordinal)) {
+                string newValue = input.Substring(8);
+                if(newValue != _lastVolumesValue) {
+                    _lastVolumesValue = newValue;
+                    VolumesEventHandler?.Invoke(this, new AudioEventArgs(SplitMessage(newValue)));
+                }
+            }
         }
 
-        private string[] splitting(string value)
-        {
-            if(value.Contains("|"))
-            {
-                return value.Split('|');
-            } else
-            {
-                return new string[] { value };
+        private static string[] SplitMessage(string value) {
+            return value.Contains("|")
+                ? value.Split('|')
+                : new[] { value };
+        }
+
+        private void HandleException(Exception ex) {
+            if(_debug) {
+                Logger.Error($"{ex.Message}\n{ex.StackTrace}");
+            } else {
+                Logger.Error(ex.Message);
             }
+        }
+
+        public void Start() {
+            if(_isRunning) return;
+
+            try {
+                if(!_port.IsOpen) {
+                    _port.Open();
+                }
+
+                _isRunning = true;
+                _port.DataReceived += DataReceivedHandler;
+                _timer.Start();
+            } catch(Exception ex) {
+                HandleException(ex);
+                Stop();
+            }
+        }
+
+        public void Stop() {
+            if(!_isRunning) return;
+
+            _isRunning = false;
+            _timer.Stop();
+            _port.DataReceived -= DataReceivedHandler;
+
+            try {
+                if(_port.IsOpen) {
+                    _port.Close();
+                }
+            } catch(Exception ex) {
+                HandleException(ex);
+            }
+
+            PortCloseEventHandler?.Invoke(this, new PortEventArgs());
+        }
+
+        public void Dispose() {
+            Stop();
+            _timer.Dispose();
+            _port.Dispose();
         }
     }
 
+    sealed class AudioEventArgs : EventArgs {
+        public string[] Values { get; }
 
-    class AudioEventArgs : EventArgs
-    {
-        public string[] values { get; }
-
-        public AudioEventArgs(string[] values)
-        {
-            this.values = values;
+        public AudioEventArgs(string[] values) {
+            Values = values;
         }
     }
 
-    class PortEventArgs : EventArgs
-    {
-    }
-
-    class ExceptionEventArgs : EventArgs
-    {
-        public Exception exception { get; }
-
-        public ExceptionEventArgs(Exception exception)
-        {
-            this.exception = exception;
-        }
+    sealed class PortEventArgs : EventArgs {
     }
 }

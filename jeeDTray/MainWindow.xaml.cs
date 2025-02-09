@@ -1,103 +1,146 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.IO.Ports;
 using System.Linq;
-using System.Text;
 using System.Threading.Tasks;
 using System.Windows;
-using System.Windows.Controls;
-using System.Windows.Data;
-using System.Windows.Documents;
-using System.Windows.Input;
-using System.Windows.Media;
-using System.Windows.Media.Imaging;
-using System.Windows.Navigation;
-using System.Windows.Shapes;
-
-namespace jeeDTray
-{
-    /// <summary>
-    /// Logique d'interaction pour MainWindow.xaml
-    /// </summary>
-    public partial class MainWindow : Window
-    {
-        private AudioManager audioManager;
-        private Configuration config;
-        private COMAudioReader comAudioReader;
-
-        public MainWindow()
-        {
-            Logger.Info("Starting service...");
-
-            audioManager = new AudioManager();
-            config = Configuration.load();
 
 
+namespace jeeDTray {
+    public partial class MainWindow : Window, IDisposable {
+        private readonly AudioManager _audioManager;
+        private readonly Configuration _config;
+        private readonly Dictionary<string, List<string>> _appCache;
+        private COMAudioReader _comAudioReader;
+        private bool _isDisposed;
+
+        public MainWindow() {
+            InitializeComponent();
+
+            try {
+                Logger.Info("Starting service...");
+                _audioManager = new AudioManager();
+                _config = Configuration.load();
+                _appCache = new Dictionary<string, List<string>>();
+
+                InitializeSerialPort();
+                InitializeAppCache();
+
+                Application.Current.Exit += OnApplicationExit;
+                Closing += OnWindowClosing;
+            } catch(Exception ex) {
+                Logger.Error($"Initialization error: {ex.Message}");
+                Environment.Exit(1);
+            }
+        }
+
+        private void InitializeSerialPort() {
             string[] ports = SerialPort.GetPortNames();
-
-            if(!ports.Contains(config.comPort))
-            {
-                Logger.Error("Port \"" + config.comPort + "\" not exists." + (ports.Length > 0 ? " Please use : " + string.Join(", ", ports) : ""));
-                Logger.Info("Stopping service...");
-                Environment.Exit(0);
-                return;
+            if(!ports.Contains(_config.comPort)) {
+                string availablePorts = ports.Length > 0 ? $" Please use: {string.Join(", ", ports)}" : string.Empty;
+                Logger.Error($"Port \"{_config.comPort}\" not exists.{availablePorts}");
+                Environment.Exit(1);
             }
 
-            comAudioReader = new COMAudioReader(new SerialPort(config.comPort, config.baudRate, Parity.None, 8, StopBits.One), config.readInterval, config.debug);
+            var serialPort = new SerialPort(_config.comPort, _config.baudRate, Parity.None, 8, StopBits.One) {
+                ReadTimeout = 500,
+                WriteTimeout = 500
+            };
 
-            comAudioReader.VolumesEventHandler += ComAudioReader_VolumesEventHandler;
-            comAudioReader.DevicesEventHandler += ComAudioReader_DevicesEventHandler;
-            comAudioReader.PortCloseEventHandler += ComAudioReader_PortCloseEventHandler;
+            _comAudioReader = new COMAudioReader(serialPort, _config.readInterval, _config.debug);
+            _comAudioReader.VolumesEventHandler += HandleVolumesEvent;
+            _comAudioReader.DevicesEventHandler += HandleDevicesEvent;
+            _comAudioReader.PortCloseEventHandler += HandlePortCloseEvent;
 
-            comAudioReader.Start();
+            Task.Run(() => _comAudioReader.Start())
+                .ContinueWith(t => {
+                    if(t.IsFaulted) {
+                        Logger.Error($"Failed to start COM reader: {t.Exception?.InnerException?.Message}");
+                        Application.Current.Dispatcher.Invoke(() => Environment.Exit(1));
+                    }
+                });
         }
 
-
-        private void ComAudioReader_PortCloseEventHandler(object sender, PortEventArgs e)
-        {
-            Logger.Error("Port \"" + config.comPort + "\" closed.");
-            Logger.Info("Stopping service...");
-            Environment.Exit(0);
-        }
-
-        public void Stop()
-        {
-            comAudioReader.Stop();
-        }
-
-
-        void ComAudioReader_DevicesEventHandler(object sender, AudioEventArgs e)
-        {
-            foreach(var entries in e.values.Select((value, index) => new { index, value }))
-            {
-                string deviceName = config.devices[entries.index.ToString()];
-
-                if(entries.value == "1")
-                {
-                    Logger.Info("Changing default audio device to \"" + deviceName + "\".");
-                    audioManager.SetDefaultAudioDevice(deviceName);
-                }
+        private void InitializeAppCache() {
+            foreach(var app in _config.apps) {
+                _appCache[app.Key] = new List<string>(app.Value);
             }
         }
 
-        void ComAudioReader_VolumesEventHandler(object sender, AudioEventArgs e)
-        {
-            foreach(var entries in e.values.Select((value, index) => new { index, value }))
-            {
-                if(!config.apps.ContainsKey(entries.index.ToString())) continue;
+        private void HandlePortCloseEvent(object sender, PortEventArgs e) {
+            Logger.Error($"Port \"{_config.comPort}\" closed.");
+            Application.Current.Dispatcher.Invoke(() => Environment.Exit(0));
+        }
 
-                List<string> apps = config.apps[entries.index.ToString()];
+        private void HandleDevicesEvent(object sender, AudioEventArgs e) {
+            if(e?.Values == null) return;
 
-                int volume = Int32.Parse(entries.value);
+            for(int i = 0; i < e.Values.Length; i++) {
+                if(e.Values[i] != "1") continue;
 
-                if(apps.Any(app => app == "master"))
-                {
-                    audioManager.SetMasterVolume(volume);
-                } else
-                {
-                    audioManager.SetProcessVolume(apps.ToArray(), volume);
-                }
+                string indexStr = i.ToString();
+                if(!_config.devices.TryGetValue(indexStr, out string deviceName)) continue;
+
+                Logger.Info($"Changing default audio device to \"{deviceName}\".");
+                Task.Run(() => _audioManager.SetDefaultAudioDevice(deviceName))
+                    .ContinueWith(t => {
+                        if(t.IsFaulted) {
+                            Logger.Error($"Failed to set audio device: {t.Exception?.InnerException?.Message}");
+                        }
+                    });
             }
+        }
+
+        private void HandleVolumesEvent(object sender, AudioEventArgs e) {
+            if(e?.Values == null) return;
+
+            for(int i = 0; i < e.Values.Length; i++) {
+                string indexStr = i.ToString();
+                if(!_appCache.TryGetValue(indexStr, out List<string> apps)) continue;
+
+                if(!int.TryParse(e.Values[i], out int volume)) continue;
+
+                Task.Run(() => {
+                    try {
+                        if(apps.Contains("master", StringComparer.OrdinalIgnoreCase)) {
+                            _audioManager.SetMasterVolume(volume);
+                        } else {
+                            _audioManager.SetProcessVolume(apps.ToArray(), volume);
+                        }
+                    } catch(Exception ex) {
+                        Logger.Error($"Volume adjustment error: {ex.Message}");
+                    }
+                });
+            }
+        }
+
+        private void OnApplicationExit(object sender, ExitEventArgs e) {
+            Dispose();
+        }
+
+        private void OnWindowClosing(object sender, CancelEventArgs e) {
+            Dispose();
+        }
+
+        public void Dispose() {
+            if(_isDisposed) return;
+
+            _comAudioReader?.Stop();
+            _comAudioReader?.Dispose();
+            _audioManager?.Dispose();
+
+            _appCache?.Clear();
+
+            Application.Current.Exit -= OnApplicationExit;
+            Closing -= OnWindowClosing;
+
+            _isDisposed = true;
+            GC.SuppressFinalize(this);
+        }
+
+        ~MainWindow() {
+            Dispose();
         }
     }
 }
